@@ -4,80 +4,74 @@ import re
 
 
 class ArxivSpider(scrapy.Spider):
-    name = "arxiv"  # 补充：原代码可能漏了name属性，需确保存在
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # 读取分类环境变量（原有逻辑）
         categories = os.environ.get("CATEGORIES", "cs.CV")
-        self.target_categories = set(map(str.strip, categories.split(",")))
-        
-        # ========== 核心修改：读取KEYWORDS环境变量 ==========
-        # 默认值：空字符串（表示不筛选关键词），也可设默认关键词如 "LLM"
-        keywords = os.environ.get("KEYWORDS", "")
-        self.target_keywords = set()
-        if keywords.strip():  # 避免空值分割出空字符串
-            self.target_keywords = set(map(str.strip, keywords.split(",")))
-        
-        # 构建起始URL（原有逻辑）
+        categories = categories.split(",")
+        # 保存目标分类列表，用于后续验证
+        self.target_categories = set(map(str.strip, categories))
         self.start_urls = [
             f"https://arxiv.org/list/{cat}/new" for cat in self.target_categories
-        ]
+        ]  # 起始URL（计算机科学领域的最新论文）
+
+    name = "arxiv"  # 爬虫名称
+    allowed_domains = ["arxiv.org"]  # 允许爬取的域名
 
     def parse(self, response):
-        # 原有逻辑：提取论文锚点
+        # 提取每篇论文的信息
         anchors = []
         for li in response.css("div[id=dlpage] ul li"):
             href = li.css("a::attr(href)").get()
             if href and "item" in href:
                 anchors.append(int(href.split("item")[-1]))
 
-        # 遍历论文详情（核心：增加关键词筛选）
+        # 遍历每篇论文的详细信息
         for paper in response.css("dl dt"):
             paper_anchor = paper.css("a[name^='item']::attr(name)").get()
             if not paper_anchor:
                 continue
+                
             paper_id = int(paper_anchor.split("item")[-1])
             if anchors and paper_id >= anchors[-1]:
                 continue
 
-            # 提取论文ID（原有逻辑）
+            # 获取论文ID
             abstract_link = paper.css("a[title='Abstract']::attr(href)").get()
             if not abstract_link:
                 continue
+                
             arxiv_id = abstract_link.split("/")[-1]
-
-            # 提取论文分类（原有逻辑）
+            
+            # 获取对应的论文描述部分 (dd元素)
             paper_dd = paper.xpath("following-sibling::dd[1]")
-            subjects_text = paper_dd.css(".list-subjects .primary-subject::text").get() or paper_dd.css(".list-subjects::text").get()
-            paper_categories = set(re.findall(r'\(([^)]+)\)', subjects_text)) if subjects_text else set()
-
-            # 1. 先筛选分类（原有逻辑）
-            if not paper_categories.intersection(self.target_categories):
-                self.logger.debug(f"跳过论文 {arxiv_id}：分类不匹配")
+            if not paper_dd:
                 continue
-
-            # 2. 新增：筛选关键词（如果配置了关键词）
-            if self.target_keywords:  # 只有配置了关键词才筛选
-                # 提取标题和摘要（统一转小写）
-                paper_title = (paper_dd.css("div.list-title::text").get() or "").lower()
-                paper_abstract = (paper_dd.css("blockquote::text").get() or "").lower()
-                paper_content = paper_title + " " + paper_abstract
-
-                # 检查是否包含任意一个目标关键词（关键词也转小写）
-                has_keyword = any(
-                    keyword.lower() in paper_content 
-                    for keyword in self.target_keywords
-                )
-                if not has_keyword:
-                    self.logger.debug(f"跳过论文 {arxiv_id}：无目标关键词")
-                    continue
-
-            # 符合条件的论文，输出数据（原有逻辑）
-            yield {
-                "id": arxiv_id,
-                "categories": list(paper_categories),
-                "title": paper_dd.css("div.list-title::text").get(),
-                "abstract": paper_dd.css("blockquote::text").get()
-            }
-            self.logger.info(f"爬取论文 {arxiv_id}：分类匹配 + 关键词匹配（如有）")
+            
+            # 提取论文分类信息 - 在subjects部分
+            subjects_text = paper_dd.css(".list-subjects .primary-subject::text").get()
+            if not subjects_text:
+                # 如果找不到主分类，尝试其他方式获取分类
+                subjects_text = paper_dd.css(".list-subjects::text").get()
+            
+            if subjects_text:
+                # 解析分类信息，通常格式如 "Computer Vision and Pattern Recognition (cs.CV)"
+                # 提取括号中的分类代码
+                categories_in_paper = re.findall(r'\(([^)]+)\)', subjects_text)
+                
+                # 检查论文分类是否与目标分类有交集
+                paper_categories = set(categories_in_paper)
+                if paper_categories.intersection(self.target_categories):
+                    yield {
+                        "id": arxiv_id,
+                        "categories": list(paper_categories),  # 添加分类信息用于调试
+                    }
+                    self.logger.info(f"Found paper {arxiv_id} with categories {paper_categories}")
+                else:
+                    self.logger.debug(f"Skipped paper {arxiv_id} with categories {paper_categories} (not in target {self.target_categories})")
+            else:
+                # 如果无法获取分类信息，记录警告但仍然返回论文（保持向后兼容）
+                self.logger.warning(f"Could not extract categories for paper {arxiv_id}, including anyway")
+                yield {
+                    "id": arxiv_id,
+                    "categories": [],
+                }
